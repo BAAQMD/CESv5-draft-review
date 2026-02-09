@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CalEnviroScreen Compare (Synced + Swipe)</title>
+
+  <link rel="stylesheet" href="https://js.arcgis.com/4.34/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.34/"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+
+    .toolbar {
+      display: flex; gap: 8px; align-items: center;
+      padding: 10px 12px; border-bottom: 1px solid #ddd; background: #fff;
+    }
+    .toolbar button {
+      padding: 8px 10px; border: 1px solid #ccc; border-radius: 8px;
+      background: #f7f7f7; cursor: pointer;
+    }
+    .toolbar button.active { background: #e9eefc; border-color: #9bb2ff; }
+    .note { margin-left: auto; font-size: 12px; color: #555; white-space: nowrap; }
+
+    .stage { position: relative; height: calc(100% - 52px); overflow: hidden; background: #111; }
+
+    .viewA, .viewB { position: absolute; top: 0; bottom: 0; width: 50%; min-width: 0; }
+    .viewA { left: 0; }
+    .viewB { left: 50%; }
+
+    .swipe .viewA { left: 0; width: 100%; }
+    .swipe .viewB { left: 0; width: 100%; }
+
+    .divider { position: absolute; top: 0; height: 100%; width: 0; pointer-events: none; display: none; z-index: 10; }
+    .divider-line { position: absolute; top: 0; left: -1px; width: 2px; height: 100%;
+      background: rgba(255,255,255,0.9); box-shadow: 0 0 0 1px rgba(0,0,0,0.25); }
+    .divider-handle {
+      position: absolute; top: 50%; left: -16px; transform: translateY(-50%);
+      width: 32px; height: 44px; border-radius: 10px;
+      background: rgba(255,255,255,0.95); box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+      display: grid; place-items: center; pointer-events: auto;
+      cursor: ew-resize; user-select: none; font-size: 18px; opacity: 0.9;
+    }
+    .swipe .divider { display: block; }
+
+    .status {
+      position: absolute; left: 12px; bottom: 12px; z-index: 20;
+      max-width: min(720px, calc(100% - 24px));
+      background: rgba(255,255,255,0.95);
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12px;
+      color: #111;
+      display: none;
+      white-space: pre-wrap;
+    }
+    .status.show { display: block; }
+  </style>
+</head>
+
+<body>
+  <div class="toolbar">
+    <button id="btnSplit" class="active" type="button">Side-by-side</button>
+    <button id="btnSwipe" type="button">Swipe</button>
+    <div class="note">Drag/zoom either map; extents stay synced.</div>
+  </div>
+
+  <div id="stage" class="stage">
+    <div id="viewA" class="viewA"></div>
+    <div id="viewB" class="viewB"></div>
+
+    <div id="divider" class="divider" aria-hidden="true">
+      <div class="divider-line"></div>
+      <div id="handle" class="divider-handle" title="Drag to swipe">⟷</div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script>
+    /*
+      Invariant (do not break this):
+        - A is ALWAYS the LEFT map in side-by-side.
+        - A is ALWAYS the BASE map in swipe mode.
+        - B is ALWAYS the RIGHT map in side-by-side.
+        - B is ALWAYS the OVERLAY map in swipe mode (revealed on the RIGHT side).
+
+      To swap which dataset is “left/base” vs “right/overlay”, ONLY swap the two IDs below.
+    */
+
+    // A = left/base, B = right/overlay
+    const WEBMAP_ID_A = "d9cf7a40b5754db2ab469266bd7f45f1"; // CES 5.0 Draft Results (LEFT)
+    const WEBMAP_ID_B = "04ba2aac62254420a7b4ac31876b1e6c"; // CES 4.0 (RIGHT)
+
+    (function waitForArcGISRequire() {
+      if (typeof window.require !== "function") {
+        setTimeout(waitForArcGISRequire, 25);
+        return;
+      }
+
+      window.require([
+        "esri/config",
+        "esri/WebMap",
+        "esri/views/MapView"
+      ], (esriConfig, WebMap, MapView) => {
+
+        const stage    = document.getElementById("stage");
+        const viewADiv = document.getElementById("viewA");
+        const viewBDiv = document.getElementById("viewB");
+        const btnSplit = document.getElementById("btnSplit");
+        const btnSwipe = document.getElementById("btnSwipe");
+        const divider  = document.getElementById("divider");
+        const handle   = document.getElementById("handle");
+        const status   = document.getElementById("status");
+
+        viewADiv.style.overflow = "hidden";
+        viewBDiv.style.overflow = "hidden";
+
+        function showStatus(msg) {
+          status.textContent = msg;
+          status.classList.add("show");
+        }
+        function clearStatus() {
+          status.classList.remove("show");
+          status.textContent = "";
+        }
+
+        // GitHub Pages is HTTPS; some map layers/services may still be http://
+        // Browsers will block mixed content, so upgrade http -> https when possible.
+        esriConfig.request.interceptors.push({
+          urls: /.*/,
+          before: (params) => {
+            if (typeof params.url === "string" && params.url.startsWith("http://")) {
+              params.url = "https://" + params.url.slice("http://".length);
+            }
+          }
+        });
+
+        const webmapA = new WebMap({ portalItem: { id: WEBMAP_ID_A } });
+        const webmapB = new WebMap({ portalItem: { id: WEBMAP_ID_B } });
+
+        const viewA = new MapView({ container: viewADiv, map: webmapA });
+        const viewB = new MapView({ container: viewBDiv, map: webmapB });
+
+        // Divider fraction so it stays centered (or at dragged fraction) on resize
+        let dividerFrac = 0.5;
+
+        function setDividerFromFrac() {
+          const rect = stage.getBoundingClientRect();
+          setDividerPx(rect.width * dividerFrac);
+        }
+
+        // IMPORTANT: In swipe mode, we keep “sides” consistent with side-by-side:
+        //   LEFT side = A (base)
+        //   RIGHT side = B (overlay)
+        // so we clip B to show ONLY the RIGHT portion.
+        function setDividerPx(x) {
+          const rect = stage.getBoundingClientRect();
+          const clamped = Math.max(0, Math.min(x, rect.width));
+          dividerFrac = rect.width ? (clamped / rect.width) : 0.5;
+
+          divider.style.left = clamped + "px";
+
+          // Show RIGHT portion of B, hide LEFT portion of B
+          const leftInset = Math.max(0, clamped);
+          viewBDiv.style.clipPath = `inset(0 0 0 ${leftInset}px)`;
+        }
+
+        // Safari-friendly redraw after layout changes
+        function forceRedraw() {
+          requestAnimationFrame(() => {
+            viewA.resize(); viewB.resize();
+            viewA.requestRender(); viewB.requestRender();
+            requestAnimationFrame(() => {
+              viewA.resize(); viewB.resize();
+              viewA.requestRender(); viewB.requestRender();
+            });
+          });
+        }
+
+        // Sync extents when interaction ends (bidirectional)
+        let syncing = false;
+        function sync(fromView, toView) {
+          if (syncing) return;
+          syncing = true;
+          toView.viewpoint = fromView.viewpoint.clone();
+          requestAnimationFrame(() => { syncing = false; });
+        }
+
+        Promise.allSettled([viewA.when(), viewB.when()]).then((results) => {
+          const bad = results.map((r, i) => ({ r, i })).filter(x => x.r.status === "rejected");
+          if (bad.length) {
+            const lines = bad.map(x => `Map ${x.i === 0 ? "A (left/base)" : "B (right/overlay)"} failed: ${String(x.r.reason)}`);
+            showStatus("One or both WebMaps failed to load.\n\n" + lines.join("\n") + "\n\nCheck Console/Network for blocked requests.");
+            return;
+          }
+
+          clearStatus();
+
+          // Lock initial extent once: copy A -> B
+          viewB.viewpoint = viewA.viewpoint.clone();
+
+          viewA.watch("stationary", (s) => { if (s) sync(viewA, viewB); });
+          viewB.watch("stationary", (s) => { if (s) sync(viewB, viewA); });
+
+          setDividerFromFrac();
+          forceRedraw();
+        });
+
+        // Swipe drag logic
+        let dragging = false;
+        function onDown(e) {
+          if (!stage.classList.contains("swipe")) return;
+          dragging = true;
+          e.preventDefault();
+        }
+        function onMove(e) {
+          if (!dragging) return;
+          const rect = stage.getBoundingClientRect();
+          const clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+          setDividerPx(clientX - rect.left);
+        }
+        function onUp() { dragging = false; }
+
+        handle.addEventListener("mousedown", onDown);
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+        handle.addEventListener("touchstart", onDown, { passive: false });
+        window.addEventListener("touchmove", onMove, { passive: false });
+        window.addEventListener("touchend", onUp);
+
+        // Mode toggle: do NOT change geometry semantics here; CSS owns split layout,
+        // clip-path owns swipe reveal. That keeps the invariant stable.
+        function setMode(mode) {
+          const isSwipe = mode === "swipe";
+          stage.classList.toggle("swipe", isSwipe);
+          btnSplit.classList.toggle("active", !isSwipe);
+          btnSwipe.classList.toggle("active", isSwipe);
+
+          if (isSwipe) {
+            setDividerFromFrac();
+          } else {
+            // No clipping in split mode
+            viewBDiv.style.clipPath = "";
+          }
+
+          forceRedraw();
+        }
+
+        btnSplit.addEventListener("click", () => setMode("split"));
+        btnSwipe.addEventListener("click", () => setMode("swipe"));
+
+        // Start in swipe
+        setMode("swipe");
+
+        window.addEventListener("resize", () => {
+          if (stage.classList.contains("swipe")) setDividerFromFrac();
+          forceRedraw();
+        });
+      });
+    })();
+  </script>
+
+</body>
+</html>
